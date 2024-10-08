@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+from itertools import product
 
 st.title('K-Anonymity with Generalization and Suppression')
 
@@ -19,7 +20,7 @@ if uploaded_file is not None:
     k = st.number_input("Select the value of k for k-anonymity", min_value=2, value=3)
     
     # Categorize columns
-    st.write("Select Direct Identifiers (these will not be included in grouping):") # Modify to include handling of direct iden such as UMRN randomization?
+    st.write("Select Direct Identifiers (these will not be included in grouping):")
     direct_identifiers = st.multiselect("Direct Identifiers", options=columns)
     
     remaining_columns = [col for col in columns if col not in direct_identifiers]
@@ -34,39 +35,46 @@ if uploaded_file is not None:
     # Remove direct identifiers
     df_anonymized = df.drop(columns=direct_identifiers)
     
-    # Generalization options for quasi-identifiers
-    generalization_options = {}
+    # Define generalization hierarchies for each quasi-identifier
+    generalization_hierarchies = {}
+    max_generalization_levels = {}
     for qi in quasi_identifiers:
-        st.write(f"Select generalization for {qi}:")
         if qi == 'Age at Colln':
-            age_option = st.selectbox("Age Generalization", ['No generalization', '5-year intervals', '10-year intervals', '20-year intervals'], key=qi)
-            generalization_options[qi] = age_option
+            # Levels: 0 - Exact age, 1 - 5-year intervals, 2 - 10-year intervals, 3 - 20-year intervals
+            generalization_hierarchies[qi] = [0, 1, 2, 3]
+            max_generalization_levels[qi] = 3
         elif qi == 'Clinic Location':
-            location_option = st.selectbox("Location Generalization", ['Exact Location', 'Region', 'Country'], key=qi)
-            generalization_options[qi] = location_option
+            # Levels: 0 - Exact location, 1 - Region, 2 - Country
+            generalization_hierarchies[qi] = [0, 1, 2]
+            max_generalization_levels[qi] = 2
         else:
-            st.write(f"No generalization options available for {qi}.")
+            # For other QIs, define generalization levels as needed
+            generalization_hierarchies[qi] = [0]  # No generalization levels defined
+            max_generalization_levels[qi] = 0
     
-    # Function to apply generalizations
-    def apply_generalizations(df, generalization_options):
+    # Generate all combinations of generalization levels
+    generalization_level_combinations = list(product(*[generalization_hierarchies[qi] for qi in quasi_identifiers]))
+    
+    # Function to apply generalizations based on levels
+    def apply_generalizations(df, quasi_identifiers, generalization_levels):
         df_generalized = df.copy()
-        for qi, option in generalization_options.items():
+        for qi, level in zip(quasi_identifiers, generalization_levels):
             if qi == 'Age at Colln':
-                if option == '5-year intervals':
+                if level == 1:
                     df_generalized[qi] = df_generalized[qi].apply(lambda x: f"{(x//5)*5}-{((x//5)*5)+4}")
-                elif option == '10-year intervals':
+                elif level == 2:
                     df_generalized[qi] = df_generalized[qi].apply(lambda x: f"{(x//10)*10}-{((x//10)*10)+9}")
-                elif option == '20-year intervals':
+                elif level == 3:
                     df_generalized[qi] = df_generalized[qi].apply(lambda x: f"{(x//20)*20}-{((x//20)*20)+19}")
                 else:
                     pass  # No generalization
-            elif qi == 'Clinic Location': # Modify to include proper clinic location generalization
-                if option == 'Region':
+            elif qi == 'Clinic Location':
+                if level == 1:
                     if 'Region' in df_generalized.columns:
                         df_generalized[qi] = df_generalized['Region']
                     else:
                         st.error("Column 'Region' not found in the dataset.")
-                elif option == 'Country':
+                elif level == 2:
                     if 'Country' in df_generalized.columns:
                         df_generalized[qi] = df_generalized['Country']
                     else:
@@ -77,7 +85,19 @@ if uploaded_file is not None:
                 pass  # No generalization applied
         return df_generalized
     
-    # Function to check and apply suppression
+    # Function to calculate Discernibility Metric
+    def calculate_discernibility_metric(df, quasi_identifiers, suppressed_count):
+        N = len(df) + suppressed_count  # Total number of records including suppressed
+        dm = 0
+        # Group by quasi-identifiers to find equivalence classes
+        equivalence_classes = df.groupby(quasi_identifiers).size().reset_index(name='counts')
+        for count in equivalence_classes['counts']:
+            dm += count ** 2  # Sum of squares of equivalence class sizes
+        # Add penalty for suppressed records
+        dm += suppressed_count * N
+        return dm
+    
+    # Function to apply suppression
     def apply_suppression(df, quasi_identifiers, k):
         if not quasi_identifiers:
             st.error("No quasi-identifiers selected. Cannot apply k-anonymity.")
@@ -100,19 +120,71 @@ if uploaded_file is not None:
         
         return df_suppressed, is_k_anonymous, suppressed_record_count
     
-    # Apply generalizations
-    df_anonymized = apply_generalizations(df_anonymized, generalization_options)
+    # List to store results
+    results = []
     
-    # Apply suppression
-    df_anonymized, is_k_anonymous, records_suppressed = apply_suppression(df_anonymized, quasi_identifiers, k)
+    # Iterate over all generalization level combinations
+    for levels in generalization_level_combinations:
+        # Apply generalizations
+        df_generalized = apply_generalizations(df_anonymized, quasi_identifiers, levels)
+        
+        # Apply suppression
+        df_suppressed, is_k_anonymous, records_suppressed = apply_suppression(df_generalized, quasi_identifiers, k)
+        
+        # Calculate suppression percentage
+        suppression_percentage = (records_suppressed / len(df)) * 100
+        
+        # Calculate Discernibility Metric
+        dm = calculate_discernibility_metric(df_suppressed, quasi_identifiers, records_suppressed)
+        
+        # Store result if k-anonymity is achieved
+        if is_k_anonymous:
+            results.append({
+                'generalization_levels': levels,
+                'df': df_suppressed,
+                'discernibility_metric': dm,
+                'suppression_percentage': suppression_percentage,
+                'records_suppressed': records_suppressed
+            })
     
-    # Display results
-    if is_k_anonymous:
-        st.success(f"The dataset is {k}-anonymous after suppressing {records_suppressed} records.")
+    # Check if any k-anonymous solutions were found
+    if results:
+        st.success(f"Found {len(results)} generalization options that achieve {k}-anonymity.")
+        
+        # Sort results by Discernibility Metric (lower is better)
+        results = sorted(results, key=lambda x: x['discernibility_metric'])
+        
+        # Display options for user to select
+        st.write("Generalization Options (sorted by Discernibility Metric):")
+        option_list = []
+        for idx, res in enumerate(results):
+            gen_levels = dict(zip(quasi_identifiers, res['generalization_levels']))
+            option_desc = f"Option {idx+1}: "
+            for qi in quasi_identifiers:
+                level = gen_levels[qi]
+                option_desc += f"{qi} Level {level}, "
+            option_desc += f"DM: {res['discernibility_metric']}, Suppression: {res['suppression_percentage']:.2f}%"
+            option_list.append(option_desc)
+        
+        selected_option = st.selectbox("Select a generalization option to apply:", options=option_list)
+        
+        # Get the selected option index
+        selected_index = option_list.index(selected_option)
+        selected_result = results[selected_index]
+        
+        # Display detailed metrics
+        st.write(f"Selected Option Metrics:")
+        st.write(f"- Generalization Levels: {dict(zip(quasi_identifiers, selected_result['generalization_levels']))}")
+        st.write(f"- Discernibility Metric: {selected_result['discernibility_metric']}")
+        st.write(f"- Suppression Percentage: {selected_result['suppression_percentage']:.2f}%")
+        st.write(f"- Records Suppressed: {selected_result['records_suppressed']}")
+        
+        # Display the anonymized data
         st.write("Anonymized Data Preview:")
-        st.dataframe(df_anonymized.head())
+        st.dataframe(selected_result['df'].head())
+        
         # Offer download of anonymized dataset
-        csv = df_anonymized.to_csv(index=False)
+        csv = selected_result['df'].to_csv(index=False)
         st.download_button(label="Download Anonymized Data", data=csv, file_name='anonymized_data.csv', mime='text/csv')
     else:
-        st.error(f"Unable to achieve {k}-anonymity with the current generalizations and suppression.")
+        st.error(f"Unable to achieve {k}-anonymity with the available generalizations and suppression.")
